@@ -1,109 +1,193 @@
+import bcrypt from "bcryptjs";
 import express from "express";
+import jsonwebtoken from "jsonwebtoken";
+import { saveToken } from "./auth.js";
+import cookieParser from "cookie-parser";
+import { authenticate } from "./middleware.js";
+import type { Response } from "express";
+import type { Request } from "./types.js";
 
 const app = express();
 const port = 3000;
 
-// json レスポンスを使用可能にするミドルウェアの追加
 app.use(express.json());
+app.use(cookieParser());
+app.use(authenticate(["/api/v1/auth/sign_up", "/api/v1/auth/sign_in"]));
 
-// "/" に GET リクエストを送った際のレスポンスの追加
-app.get("/", (_req, res) => {
-  res.send("Hello Express + TypeScript!");
-});
-
-app.get("/api/v1/health", (_req, res) => {
-  res.json({ status: "ok" });
-});
-
-app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
-});
-
-function randomHumanName(length = 6) {
-  const chars = "abcdefghijklmnopqrstuvwxyz";
-  let name = "";
-
-  for (let i = 0; i < length; i++) {
-    name += chars[Math.floor(Math.random() * chars.length)];
-  }
-
-  return name.charAt(0).toUpperCase() + name.slice(1);
+async function hashPassword(password: string): Promise<string> {
+  const salt = await bcrypt.genSalt(10);
+  return bcrypt.hash(password, salt);
 }
 
-app.get("/api/v1/random-name", (_req, res) => {
-  const nameArray = new Array(10000).fill(0).map((_, index) => {
-    return {
-      id: index + 1,
-      name: randomHumanName(Math.floor(Math.random() * 7) + 5),
-      age: Math.floor(Math.random() * 60) + 18,
-    };
+export async function verifyPassword(
+  password: string,
+  hashedPassword: string,
+): Promise<boolean> {
+  if (!password || !hashedPassword) {
+    return false;
+  }
+
+  return await bcrypt.compare(password, hashedPassword);
+}
+
+function generateAccessToken(id: number, username: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    jsonwebtoken.sign(
+      {
+        id,
+        name: username,
+      },
+      "your_secret_key",
+      { expiresIn: "1h" },
+      (err, token) => {
+        if (err) {
+          return reject(err);
+        }
+        return resolve(token!);
+      },
+    );
   });
-  res.json({ nameArray });
-});
+}
 
-const users = [
-  { id: 1, name: "John Doe", age: 30 },
-  { id: 2, name: "Jane Smith", age: 25 },
-  { id: 3, name: "Alice Johnson", age: 28 },
-];
+type User = {
+  id: number;
+  name: string;
+  age: number;
+  passwordDigest: string;
+};
 
-app.get("/api/v1/users", (_req, res) => {
-  res.json({
-    data: users,
-  });
-});
+const users: User[] = [];
 
-app.get("/api/v1/users/:id", (req, res) => {
-  const { id } = req.params;
-  const user = users.find((u) => u.id === Number(id));
+app.get("/api/v1/users/me", (req: Request, res: Response) => {
+  if (!req.user) {
+    return res.status(401).json({
+      error: "Unauthorized",
+    });
+  }
+  const user = users.find((u) => u.id === req.user!.id);
   if (!user) {
-    return res.status(404).json({ error: "User not found" });
+    return res.status(404).json({
+      error: "User not found",
+    });
   }
+  const userResponse = {
+    id: user!.id,
+    name: user!.name,
+    age: user!.age,
+  };
   res.json({
-    data: user,
+    data: userResponse,
   });
 });
 
-app.post("/api/v1/users", (req, res) => {
-  const { name, age } = req.body;
-  if (!name || !age) {
-    return res.status(400).json({ error: "Name and age are required" });
+app.patch("/api/v1/users/me", (req: Request, res: Response) => {
+  if (!req.user) {
+    return res.status(401).json({
+      error: "Unauthorized",
+    });
   }
-  const newUser = {
+  const user = users.find((u) => u.id === req.user!.id);
+  if (!user) {
+    return res.status(404).json({
+      error: "User not found",
+    });
+  }
+
+  const { age } = req.body;
+  if (age !== undefined) {
+    if (typeof age !== "number" || age <= 0) {
+      return res.status(400).json({
+        error: "年齢は0より大きい数値である必要があります",
+      });
+    }
+  }
+
+  user.age = age;
+  const userResponse = {
+    id: user!.id,
+    name: user!.name,
+    age: user!.age,
+  };
+
+  res.json({
+    data: userResponse,
+  });
+});
+
+app.post("/api/v1/auth/sign_up", async (req, res) => {
+  const { name, age, password, passwordConfirmation } = req.body;
+  if (password !== passwordConfirmation) {
+    return res.status(400).json({
+      error: "パスワードとパスワード確認が一致しません",
+    });
+  }
+
+  if (age <= 0) {
+    return res.status(400).json({
+      error: "年齢は0より大きい必要があります",
+    });
+  }
+  if (name.length < 3) {
+    return res.status(400).json({
+      error: "名前は3文字以上である必要があります",
+    });
+  }
+  if (users.some((user) => user.name === name)) {
+    return res.status(400).json({
+      error: "その名前は既に使用されています",
+    });
+  }
+
+  const hashedPassword = await hashPassword(password);
+
+  const newUser: User = {
     id: users.length + 1,
     name,
     age,
+    passwordDigest: hashedPassword,
   };
   users.push(newUser);
 
-  res.status(201).json({
+  return res.status(201).json({
     data: newUser,
   });
 });
 
-app.patch("/api/v1/users/:id", (req, res) => {
-  const { name, age } = req.body;
-  const { id } = req.params;
-  const user = users.find((u) => u.id === Number(id));
+app.post("/api/v1/auth/sign_in", async (req, res) => {
+  const { name, password } = req.body;
+  const user = users.find((user) => user.name === name);
+
   if (!user) {
-    return res.status(404).json({ error: "User not found" });
+    return res.status(401).json({
+      error: "ユーザー名或いはパスワードが間違っています。",
+    });
   }
-  if (name) user.name = name;
-  if (age) user.age = age;
+
+  if (!verifyPassword(password, user.passwordDigest)) {
+    return res.status(401).json({
+      error: "ユーザー名或いはパスワードが間違っています。",
+    });
+  }
+
+  const token = await generateAccessToken(user.id, user.name);
+  saveToken(res, token);
+
+  const userResponse = {
+    id: user.id,
+    name: user.name,
+    age: user.age,
+  };
+
   res.json({
-    data: user,
+    accessToken: token,
+    data: userResponse,
   });
 });
 
-app.delete("/api/v1/users/:id", (req, res) => {
-  const { id } = req.params;
-  const userIndex = users.findIndex((u) => u.id === Number(id));
-  if (userIndex === -1) {
-    return res.status(404).json({ error: "User not found" });
-  }
-  const user = users.splice(userIndex, 1);
+app.post("/api/v1/auth/sign_out", (_req, res) => {
+  res.clearCookie("accessToken");
   res.json({
-    data: user,
+    data: "Successfully signed out",
   });
 });
 
